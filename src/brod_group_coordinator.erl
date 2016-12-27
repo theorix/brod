@@ -30,6 +30,7 @@
         , commit_offsets/1
         , commit_offsets/2
         , start_link/6
+        , get_committed_offsets/3
         ]).
 
 -export([ code_change/3
@@ -241,6 +242,18 @@ commit_offsets(CoordinatorPid, Offsets0) ->
       {error, timeout}
   end.
 
+get_committed_offsets(Client, GroupId, TopicPartitions) ->
+  {{Host, Port}, Config} =
+    ?ESCALATE(brod_client:get_group_coordinator(Client, GroupId)),
+  ClientId = make_group_connection_client_id(),
+  SockPid =
+        ?ESCALATE(brod_sock:start_link(self(), Host, Port, ClientId, Config)),
+  Offsets = get_committed_offsets(#state{ offset_commit_policy = commit_to_kafka_v2
+                            , groupId              = GroupId
+                            , sock_pid             = SockPid
+                            }, TopicPartitions),
+  brod_sock:stop(SockPid),
+  Offsets.
 
 %%%_* gen_server callbacks =====================================================
 
