@@ -32,6 +32,7 @@
         , loop/2
         , request_sync/3
         , request_async/2
+        , request_send/2
         , start/4
         , start/5
         , start_link/4
@@ -113,6 +114,11 @@ request_sync(Pid, Request, Timeout) ->
     {ok, CorrId}    -> wait_for_resp(Pid, Request, CorrId, Timeout);
     {error, Reason} -> {error, Reason}
   end.
+
+request_send(Pid, Request) ->
+  Mref = make_ref(),
+  erlang:send(Pid, {{self(), Mref}, {send,Request}}),
+  {ok, Mref}.
 
 -spec wait_for_resp(pid(), term(), corr_id(), timeout()) ->
         {ok, term()} | {error, any()}.

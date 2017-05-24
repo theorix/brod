@@ -178,6 +178,7 @@ sync_produce_request(#brod_produce_reply{call_ref = CallRef} = ExpectedReply) ->
 %%%_* gen_server callbacks =====================================================
 
 init({ClientPid, Topic, Partition, Config}) ->
+  process_flag(trap_exit, true),
   BufferLimit = ?config(partition_buffer_limit, ?DEFAULT_PARITION_BUFFER_LIMIT),
   OnWireLimit = ?config(partition_onwire_limit, ?DEFAULT_PARITION_ONWIRE_LIMIT),
   MaxBatchSize = ?config(max_batch_size, ?DEFAULT_MAX_BATCH_SIZE),
@@ -205,7 +206,7 @@ init({ClientPid, Topic, Partition, Config}) ->
         sock_send(SockPid, ProduceRequest)
     end,
   Buffer = brod_producer_buffer:new(BufferLimit, OnWireLimit,
-                                    MaxBatchSize, MaxRetries, SendFun),
+                                    MaxBatchSize, MaxRetries, SendFun, RequiredAcks),
 
   State = #state{ client_pid       = ClientPid
                 , topic            = Topic
@@ -228,12 +229,13 @@ handle_info(?RETRY_MSG, State0) ->
   {noreply, State};
 handle_info({'DOWN', _MonitorRef, process, Pid, Reason},
             #state{sock_pid = Pid} = State) ->
-  case brod_producer_buffer:is_empty(State#state.buffer) of
+  State1 = maybe_handle_socket_res({socket_pid_down, Reason}, State),
+  case brod_producer_buffer:is_empty(State1#state.buffer) of
     true ->
       %% no socket restart in case of empty request buffer
-      {noreply, State#state{sock_pid = ?undef}};
+      {noreply, State1#state{sock_pid = ?undef}};
     false ->
-      {ok, NewState} = schedule_retry(State, Reason),
+      {ok, NewState} = schedule_retry(State1, Reason),
       {noreply, NewState#state{sock_pid = ?undef}}
   end;
 handle_info({produce, CallRef, Key, Value},
@@ -292,8 +294,11 @@ handle_info({msg, Pid, CorrId, #kpro_ProduceResponse{} = R},
         end
     end,
   {noreply, NewState};
-handle_info(_Info, State) ->
-  {noreply, State}.
+handle_info({'EXIT', _Pid, _Reason}, State) ->
+  {stop, normal, State};
+handle_info(Info, State) ->
+  {ok, NewState} = maybe_handle_socket_res(Info, State),
+  {noreply, NewState}.
 
 handle_call(stop, _From, State) ->
   {stop, normal, ok, State};
@@ -306,7 +311,20 @@ handle_cast(_Cast, State) ->
 code_change(_OldVsn, State, _Extra) ->
   {ok, State}.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, #state{buffer = Buffer, topic = Topic, partition=Partition} = _State) ->
+  error_logger:info_msg("producer is terminate: topic=~s, partition=~p",
+                        [Topic, Partition]),
+  spawn(fun() ->
+            Reqs = brod_producer_buffer:get_buffered_reqs(Buffer),
+            lists:foldl(
+              fun({_Key, Value}, Count) ->
+                  Count rem 100 == 0 andalso timer:sleep(100),
+                  error_logger:info_msg("producer terminate: topic=~s, partition=~p, message=~p",
+                                        [Topic, Partition, Value]),
+                  Count + 1
+              end, 1, Reqs),
+            ok
+        end),
   ok.
 
 %%%_* Internal Functions =======================================================
@@ -335,6 +353,7 @@ init_socket(#state{ client_pid = ClientPid
 
 maybe_produce(#state{buffer = Buffer0, sock_pid = SockPid} = State) ->
   case brod_producer_buffer:maybe_send(Buffer0, SockPid) of
+    skip -> {ok, State};
     {ok, Buffer}    -> {ok, State#state{buffer = Buffer}};
     {retry, Buffer} -> schedule_retry(State#state{buffer = Buffer})
   end.
@@ -344,6 +363,16 @@ maybe_demonitor(?undef) ->
 maybe_demonitor(Mref) ->
   true = erlang:demonitor(Mref, [flush]),
   ok.
+
+maybe_handle_socket_res(Res, #state{buffer = Buf} = State) ->
+    case brod_producer_buffer:maybe_handle_res(Res, Buf) of
+      skip -> 
+        {ok,State};
+      {ok, NewBuf} ->
+        {ok, State#state{buffer = NewBuf}};
+      {retry, NewBuf} ->
+        schedule_retry(State#state{buffer = NewBuf})
+    end.
 
 schedule_retry(#state{buffer = Buffer} = State, Reason) ->
   {ok, NewBuffer} = brod_producer_buffer:nack_all(Buffer, Reason),
@@ -370,7 +399,7 @@ is_retriable(_) ->
 -spec sock_send(?undef | pid(), kpro_ProduceRequest()) ->
         ok | {ok, corr_id()} | {error, any()}.
 sock_send(?undef, _KafkaReq) -> {error, sock_down};
-sock_send(SockPid, KafkaReq) -> brod_sock:request_async(SockPid, KafkaReq).
+sock_send(SockPid, KafkaReq) -> brod_sock:request_send(SockPid, KafkaReq).
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:

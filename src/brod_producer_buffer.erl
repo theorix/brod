@@ -23,12 +23,14 @@
 %% @private
 -module(brod_producer_buffer).
 
--export([ new/5
+-export([ new/6
         , add/4
         , ack/2
         , nack/3
         , nack_all/2
         , maybe_send/2
+        , get_buffered_reqs/1
+        , maybe_handle_res/2
         ]).
 
 -export([ is_empty/1
@@ -67,18 +69,23 @@
         , pending        = ?EMPTY_QUEUE :: queue:queue(#req{})
         , buffer         = ?EMPTY_QUEUE :: queue:queue(#req{})
         , onwire         = []           :: [{corr_id(), [#req{}]}]
+        , handle_res
+        , required_acks
         }).
 
 -opaque buf() :: #buf{}.
 
 %%%_* APIs =====================================================================
 
+get_buffered_reqs(#buf{buffer = Buf}) ->
+  [Func()||#req{data=Func}<-queue:to_list(Buf)].
+
 %% @doc Create a new buffer
 %% For more details: @see brod_producer:start_link/4
 %% @end
 -spec new(pos_integer(), pos_integer(),
-          pos_integer(), integer(), send_fun()) -> buf().
-new(BufferLimit, OnWireLimit, MaxBatchSize, MaxRetry, SendFun) ->
+          pos_integer(), integer(), send_fun(), integer()) -> buf().
+new(BufferLimit, OnWireLimit, MaxBatchSize, MaxRetry, SendFun, RequiredAcks) ->
   true = (BufferLimit > 0), %% assert
   true = (OnWireLimit > 0), %% assert
   true = (MaxBatchSize > 0), %% assert
@@ -88,6 +95,7 @@ new(BufferLimit, OnWireLimit, MaxBatchSize, MaxRetry, SendFun) ->
       , max_batch_size = MaxBatchSize
       , max_retries    = MaxRetry
       , send_fun       = SendFun
+      , required_acks  = RequiredAcks
       }.
 
 %% @doc Buffer a produce request.
@@ -107,11 +115,14 @@ add(#buf{pending = Pending} = Buf, CallRef, Key, Value) ->
 %% times, and 'exit' exception is raised.
 %% @end
 -spec maybe_send(buf(), pid()) -> {ok, buf()} | {retry, buf()}.
-maybe_send(#buf{} = Buf, SockPid) ->
+maybe_send(#buf{handle_res = undefined} = Buf, SockPid) ->
   case take_reqs_to_send(Buf) of
     {[], NewBuf}   -> {ok, NewBuf};
     {Reqs, NewBuf} -> do_send(Reqs, NewBuf, SockPid)
-  end.
+  end;
+maybe_send(#buf{} = _Buf, _SockPid) ->
+  skip.
+
 
 %% @doc Reply 'acked' to callers.
 -spec ack(buf(), corr_id()) -> {ok, buf()} | {error, ignored}.
@@ -236,20 +247,52 @@ take_reqs_to_send(#buf{ buffer_count = BufferCount
 do_send(Reqs, #buf{ onwire_count = OnWireCount
                   , onwire       = OnWire
                   , send_fun     = SendFun
-                  } = Buf, SockPid) ->
+                  , buffer_count = BuffCount
+                  , required_acks = RequiredAcks
+                  } = OldBuf, SockPid) ->
   MessageSet = lists:map(fun(#req{data = F}) -> F() end, Reqs),
-  case SendFun(SockPid, MessageSet) of
-    ok ->
-      %% fire and forget
-      ok = lists:foreach(fun reply_acked/1, Reqs),
-      {ok, Buf};
-    {ok, CorrId} ->
-      {ok, Buf#buf{ onwire_count = OnWireCount + 1
-                  , onwire       = OnWire ++ [{CorrId, Reqs}]
-                  }};
-    {error, Reason} ->
-      NewBuf = rebuffer_or_crash(Reqs, Buf, Reason),
-      {retry, NewBuf}
+  length(Reqs) > 0 andalso error_logger:info_msg("ReqCount:~p,BuffCount:~p", [length(Reqs),BuffCount]),
+  {ok, Ref} = SendFun(SockPid, MessageSet),
+  HandleRes = 
+    fun(Res, Buf) -> 
+        Res1 = case Res of
+                 {socket_pid_down, R} ->
+                   {error, R};
+                 {Ref, {ok, _TCorrId}} when RequiredAcks == 0 ->
+                   ok;
+                 {Ref, Reply} ->
+                   Reply;
+                 _ ->
+                   skip
+               end,
+        case Res1 of
+          skip ->
+            skip;
+          ok ->
+            %% fire and forget
+            ok = lists:foreach(fun reply_acked/1, Reqs),
+            {ok, Buf};
+          {ok, CorrId} ->
+            {ok, Buf#buf{ onwire_count = OnWireCount + 1
+                        , onwire       = OnWire ++ [{CorrId, Reqs}]
+                        }};
+          {error, Reason} ->
+            NewBuf = rebuffer_or_crash(Reqs, Buf, Reason),
+            {retry, NewBuf}
+        end
+    end,
+  {ok, OldBuf#buf{handle_res = HandleRes}}.
+
+maybe_handle_res(_Res, #buf{handle_res = undefined}) -> 
+  skip;
+maybe_handle_res(Res, #buf{handle_res = HandleRes} = Buf) ->
+  case HandleRes(Res, Buf) of
+    skip ->
+      skip;
+    {ok, NewBuf} ->
+      {ok, NewBuf#buf{handle_res = undefined}};
+    {retry, NewBuf} ->
+      {retry, NewBuf#buf{handle_res = undefined}}
   end.
 
 %% @private Put the produce requests back to buffer.
